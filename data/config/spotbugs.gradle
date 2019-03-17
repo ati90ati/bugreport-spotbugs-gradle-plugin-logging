@@ -1,0 +1,133 @@
+apply plugin: "com.github.spotbugs"
+
+dependencies {
+    spotbugs configurations.spotbugsPlugins.dependencies
+    spotbugsPlugins "com.h3xstream.findsecbugs:findsecbugs-plugin:${findsecbugsPluginVersion}"
+}
+
+def spotBugsFile = "${buildDir}/spotBugs/"
+def spotBugsConfig = "${projectConfigDir}/spotbugs/excludedBugsFilter.xml"
+
+spotbugs {
+    ignoreFailures = false
+    toolVersion = "${spotbugsVersion}"
+    effort = "max"
+    reportLevel = "low"
+    excludeFilter = file("${spotBugsConfig}")
+}
+
+// For each module of the root, a different spotbugs task is created and executed. For each of those tasks, in case of
+// a failure, we need to be able to parse the result and print in the console the bugs, so the spotbugs tasks will be
+// finalized by a parsing task.
+tasks.withType(SpotBugsTask) { task ->
+    def taskName = task.getName()
+
+    task.reports {
+        // For console output, this should be enabled. There can't be 2 different output files at the same time.
+        xml.enabled = true
+        html.enabled = false
+
+        xml.destination file("${spotBugsFile}/${taskName}.xml")
+        html.destination file("${spotBugsFile}/${taskName}.html")
+    }
+    task.finalizedBy parseSpotBugsTaskResult(task)
+
+    if (project.findProperty('enableSpotbugs') == null) {
+        gradle.startParameter.excludedTaskNames += taskName
+    }
+
+    // The configuration phase parses first the root project and only after that the project that is compiled. The case
+    // when a task exists in the root project but not in the sub-project needs to be handled to avoid compilation failures.
+    if (!isTaskRanFromRoot()) {
+        gradle.startParameter.excludedTaskNames.removeAll({ name ->
+            def taskInProject = findTaskInProject(project, name)
+            def taskInRootProject = findTaskInProject(project.rootProject, name)
+
+            taskInProject == null || !taskInProject.equals(taskInRootProject)
+        })
+    }
+}
+
+/**
+ * For a given spotbugs task, returns another task which parses the resulting xml spotbugs report and logs
+ * the errors in case any were found.
+ *
+ * @param task the spotbugs task
+ * @return the parsing task
+ */
+def parseSpotBugsTaskResult(task) {
+    return tasks.create("parse-${task.getName()}") {
+        doLast {
+            def xmlReport = task.reports.xml
+            def report = parseSpotBugsXml(xmlReport)
+
+            if (report.length() > 1) {
+                logger.error "------[${task.getName()}]-------\n ${report}"
+            }
+        }
+    }
+}
+
+/**
+ * Parses an xml file, taking into account the format of the spotbugs report. In case of any bugs, they are saved and
+ * will be parsed taking into account the following format:
+ * <BugInstance>
+ *     <Class>
+ *         <SourceLine/>
+ *     </Class>
+ * </BugInstance>
+ *
+ * @param xmlReport the xml report resulted after the spotbugs task
+ * @return the string containing the parsed bugs
+ */
+def static parseSpotBugsXml(xmlReport) {
+    def report = ""
+    if (!xmlReport.destination.exists()) {
+        return report
+    }
+    def slurped = new XmlSlurper().parse(xmlReport.destination)
+
+    slurped['BugInstance'].eachWithIndex { bug, index ->
+        report += "\n\n${index + 1}. "
+        report += "Found bug risk ${bug.@'type'} of category ${bug.@'category'} in the following place:"
+
+        bug['Class'].each { clazz ->
+            report += "\n\t- In class: \t${clazz.@'classname'}"
+        }
+        bug['Method'].each { method ->
+            report += "\n\t- In method: \t${method.@'name'}"
+        }
+        bug['Field'].each { field ->
+            report += "\n\t- Field: \t${field.@'name'}"
+        }
+        bug['SourceLine'].each { line ->
+            report += "\n\t- File: \t${line.@'sourcefile'}"
+            report += "\n\t- Line: \t${line.@'start'}"
+        }
+    }
+    return report
+}
+
+/**
+ * Retrieves the task with the given name from the given project, if such a task exists. Null is returned otherwise.
+ *
+ * @param project the desired project
+ * @param taskName the task to be found
+ * @return the task name
+ */
+def static findTaskInProject(project, taskName) {
+    def tasksWithName = project.getTasksByName(taskName, false)
+
+    return tasksWithName.isEmpty() ?
+            null :
+            tasksWithName.first().getName()
+}
+
+/**
+ * Checks if the start of the currently running task was done from the root directory.
+ *
+ * @return root or not
+ */
+def isTaskRanFromRoot() {
+    return project.gradle.startParameter.currentDir == rootProject.projectDir
+}
